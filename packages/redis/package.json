@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@redis/bloom": "5.5.6",
-    "@redis/client": "5.5.6",
+    "@redis/client": "github:MMMartt/node-redis#b59b9172cc793c2602b7d2b051a6e0073e7e0f99&path:/packages/client",
     "@redis/json": "5.5.6",
     "@redis/search": "5.5.6",
     "@redis/time-series": "5.5.6"

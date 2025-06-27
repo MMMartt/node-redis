@@ -328,17 +328,26 @@ export class PubSub {
       if (!listeners.size) continue;
 
       this.#isActive = true;
-      this.#subscribing++;
-      const callback = () => this.#subscribing--;
-      commands.push({
-        args: [
-          COMMANDS[type as PubSubType].subscribe,
-          ...listeners.keys()
-        ],
-        channelsCounter: listeners.size,
-        resolve: callback,
-        reject: callback
-      } satisfies PubSubCommand);
+      let size = listeners.size;
+      const callback = () => {
+        size--;
+        if (size === 0) {
+          this.#subscribing--;
+        }
+      };
+      const keys = Array.from(listeners.keys());
+      for (const channel of keys) {
+        this.#subscribing++;
+        commands.push({
+          args: [
+            COMMANDS[type as PubSubType].subscribe,
+            channel
+          ],
+          channelsCounter: 1,
+          resolve: callback,
+          reject: callback
+        } satisfies PubSubCommand);
+      }
     }
 
     return commands;

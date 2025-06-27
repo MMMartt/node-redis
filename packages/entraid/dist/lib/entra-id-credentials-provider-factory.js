@@ -1,0 +1,260 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.AuthCodeFlowHelper = exports.DEFAULT_TOKEN_MANAGER_CONFIG = exports.DEFAULT_RETRY_POLICY = exports.REDIS_SCOPE = exports.REDIS_SCOPE_DEFAULT = exports.EntraIdCredentialsProviderFactory = void 0;
+const msal_common_1 = require("@azure/msal-common");
+const msal_node_1 = require("@azure/msal-node");
+const authx_1 = require("@redis/client/dist/lib/authx");
+const azure_identity_provider_1 = require("./azure-identity-provider");
+const entraid_credentials_provider_1 = require("./entraid-credentials-provider");
+const msal_identity_provider_1 = require("./msal-identity-provider");
+/**
+ * This class is used to create credentials providers for different types of authentication flows.
+ */
+class EntraIdCredentialsProviderFactory {
+    /**
+     * This method is used to create a ManagedIdentityProvider for both system-assigned and user-assigned managed identities.
+     *
+     * @param params
+     * @param userAssignedClientId For user-assigned managed identities, the developer needs to pass either the client ID,
+     * full resource identifier, or the object ID of the managed identity when creating ManagedIdentityApplication.
+     *
+     */
+    static createManagedIdentityProvider(params, userAssignedClientId) {
+        const config = {
+            // For user-assigned identity, include the client ID
+            ...(userAssignedClientId && {
+                managedIdentityIdParams: {
+                    userAssignedClientId
+                }
+            }),
+            system: {
+                loggerOptions
+            }
+        };
+        const client = new msal_node_1.ManagedIdentityApplication(config);
+        const idp = new msal_identity_provider_1.MSALIdentityProvider(() => client.acquireToken({
+            resource: params.scopes?.[0] ?? exports.REDIS_SCOPE,
+            forceRefresh: true
+        }).then(x => x === null ? Promise.reject('Token is null') : x));
+        return new entraid_credentials_provider_1.EntraidCredentialsProvider(new authx_1.TokenManager(idp, params.tokenManagerConfig), idp, {
+            onReAuthenticationError: params.onReAuthenticationError,
+            credentialsMapper: params.credentialsMapper ?? entraid_credentials_provider_1.OID_CREDENTIALS_MAPPER,
+            onRetryableError: params.onRetryableError
+        });
+    }
+    /**
+     * This method is used to create a credentials provider for system-assigned managed identities.
+     * @param params
+     */
+    static createForSystemAssignedManagedIdentity(params) {
+        return this.createManagedIdentityProvider(params);
+    }
+    /**
+     * This method is used to create a credentials provider for user-assigned managed identities.
+     * It will include the client ID as the userAssignedClientId in the ManagedIdentityConfiguration.
+     * @param params
+     */
+    static createForUserAssignedManagedIdentity(params) {
+        return this.createManagedIdentityProvider(params, params.userAssignedClientId);
+    }
+    static #createForClientCredentials(authConfig, params) {
+        const config = {
+            auth: {
+                ...authConfig,
+                authority: this.getAuthority(params.authorityConfig ?? { type: 'default' })
+            },
+            system: {
+                loggerOptions
+            }
+        };
+        const client = new msal_node_1.ConfidentialClientApplication(config);
+        const idp = new msal_identity_provider_1.MSALIdentityProvider(() => client.acquireTokenByClientCredential({
+            skipCache: true,
+            scopes: params.scopes ?? [exports.REDIS_SCOPE_DEFAULT]
+        }).then(x => x === null ? Promise.reject('Token is null') : x));
+        return new entraid_credentials_provider_1.EntraidCredentialsProvider(new authx_1.TokenManager(idp, params.tokenManagerConfig), idp, {
+            onReAuthenticationError: params.onReAuthenticationError,
+            credentialsMapper: params.credentialsMapper ?? entraid_credentials_provider_1.OID_CREDENTIALS_MAPPER,
+            onRetryableError: params.onRetryableError
+        });
+    }
+    /**
+     * This method is used to create a credentials provider for service principals using certificate.
+     * @param params
+     */
+    static createForClientCredentialsWithCertificate(params) {
+        return this.#createForClientCredentials({
+            clientId: params.clientId,
+            clientCertificate: params.certificate
+        }, params);
+    }
+    /**
+     * This method is used to create a credentials provider for service principals using client secret.
+     * @param params
+     */
+    static createForClientCredentials(params) {
+        return this.#createForClientCredentials({
+            clientId: params.clientId,
+            clientSecret: params.clientSecret
+        }, params);
+    }
+    /**
+     * This method is used to create a credentials provider using DefaultAzureCredential.
+     *
+     * The user needs to create a configured instance of DefaultAzureCredential ( or any other class that implements TokenCredential )and pass it to this method.
+     *
+     * The default credentials mapper for this method is OID_CREDENTIALS_MAPPER which extracts the object ID from JWT
+     * encoded token.
+     *
+     * Depending on the actual flow that DefaultAzureCredential uses, the user may need to provide different
+     * credential mapper via the credentialsMapper parameter.
+     *
+     */
+    static createForDefaultAzureCredential({ credential, scopes, options, tokenManagerConfig, onReAuthenticationError, credentialsMapper, onRetryableError }) {
+        const idp = new azure_identity_provider_1.AzureIdentityProvider(() => credential.getToken(scopes, options).then(x => x === null ? Promise.reject('Token is null') : x));
+        return new entraid_credentials_provider_1.EntraidCredentialsProvider(new authx_1.TokenManager(idp, tokenManagerConfig), idp, {
+            onReAuthenticationError: onReAuthenticationError,
+            credentialsMapper: credentialsMapper ?? entraid_credentials_provider_1.OID_CREDENTIALS_MAPPER,
+            onRetryableError: onRetryableError
+        });
+    }
+    /**
+     * This method is used to create a credentials provider for the Authorization Code Flow with PKCE.
+     * @param params
+     */
+    static createForAuthorizationCodeWithPKCE(params) {
+        const requiredScopes = ['user.read', 'offline_access'];
+        const scopes = [...new Set([...(params.scopes || []), ...requiredScopes])];
+        const authFlow = AuthCodeFlowHelper.create({
+            clientId: params.clientId,
+            redirectUri: params.redirectUri,
+            scopes: scopes,
+            authorityConfig: params.authorityConfig
+        });
+        return {
+            getPKCECodes: AuthCodeFlowHelper.generatePKCE,
+            getAuthCodeUrl: (pkceCodes) => authFlow.getAuthCodeUrl(pkceCodes),
+            createCredentialsProvider: (pkceParams) => {
+                // This is used to store the initial credentials account to be used
+                // for silent token acquisition after the initial token acquisition.
+                let initialCredentialsAccount = null;
+                const idp = new msal_identity_provider_1.MSALIdentityProvider(async () => {
+                    if (!initialCredentialsAccount) {
+                        let authResult = await authFlow.acquireTokenByCode(pkceParams);
+                        initialCredentialsAccount = authResult.account;
+                        return authResult;
+                    }
+                    else {
+                        return authFlow.client.acquireTokenSilent({
+                            forceRefresh: true,
+                            account: initialCredentialsAccount,
+                            scopes
+                        });
+                    }
+                });
+                const tm = new authx_1.TokenManager(idp, params.tokenManagerConfig);
+                return new entraid_credentials_provider_1.EntraidCredentialsProvider(tm, idp, {
+                    onReAuthenticationError: params.onReAuthenticationError,
+                    credentialsMapper: params.credentialsMapper ?? entraid_credentials_provider_1.DEFAULT_CREDENTIALS_MAPPER,
+                    onRetryableError: params.onRetryableError
+                });
+            }
+        };
+    }
+    static getAuthority(config) {
+        switch (config.type) {
+            case 'multi-tenant':
+                return `https://login.microsoftonline.com/${config.tenantId}`;
+            case 'custom':
+                return config.authorityUrl;
+            case 'default':
+                return 'https://login.microsoftonline.com/common';
+            default:
+                throw new Error('Invalid authority configuration');
+        }
+    }
+}
+exports.EntraIdCredentialsProviderFactory = EntraIdCredentialsProviderFactory;
+exports.REDIS_SCOPE_DEFAULT = 'https://redis.azure.com/.default';
+exports.REDIS_SCOPE = 'https://redis.azure.com';
+const loggerOptions = {
+    loggerCallback(loglevel, message, containsPii) {
+        if (!containsPii)
+            console.log(message);
+    },
+    piiLoggingEnabled: false,
+    logLevel: msal_node_1.LogLevel.Error
+};
+/**
+ * The most important part of the RetryPolicy is the `isRetryable` function. This function is used to determine if a request should be retried based
+ * on the error returned from the identity provider. The default for is to retry on network errors only.
+ */
+exports.DEFAULT_RETRY_POLICY = {
+    // currently only retry on network errors
+    isRetryable: (error) => error instanceof msal_common_1.NetworkError,
+    maxAttempts: 10,
+    initialDelayMs: 100,
+    maxDelayMs: 100000,
+    backoffMultiplier: 2,
+    jitterPercentage: 0.1
+};
+exports.DEFAULT_TOKEN_MANAGER_CONFIG = {
+    retry: exports.DEFAULT_RETRY_POLICY,
+    expirationRefreshRatio: 0.7 // Refresh token when 70% of the token has expired
+};
+/**
+ * This class is used to help with the Authorization Code Flow with PKCE.
+ * It provides methods to generate PKCE codes, get the authorization URL, and create the credential provider.
+ */
+class AuthCodeFlowHelper {
+    client;
+    scopes;
+    redirectUri;
+    constructor(client, scopes, redirectUri) {
+        this.client = client;
+        this.scopes = scopes;
+        this.redirectUri = redirectUri;
+    }
+    async getAuthCodeUrl(pkceCodes) {
+        const authCodeUrlParameters = {
+            scopes: this.scopes,
+            redirectUri: this.redirectUri,
+            codeChallenge: pkceCodes.challenge,
+            codeChallengeMethod: pkceCodes.challengeMethod
+        };
+        return this.client.getAuthCodeUrl(authCodeUrlParameters);
+    }
+    async acquireTokenByCode(params) {
+        const tokenRequest = {
+            code: params.code,
+            scopes: this.scopes,
+            redirectUri: this.redirectUri,
+            codeVerifier: params.verifier,
+            clientInfo: params.clientInfo
+        };
+        return this.client.acquireTokenByCode(tokenRequest);
+    }
+    static async generatePKCE() {
+        const cryptoProvider = new msal_node_1.CryptoProvider();
+        const { verifier, challenge } = await cryptoProvider.generatePkceCodes();
+        return {
+            verifier,
+            challenge,
+            challengeMethod: 'S256'
+        };
+    }
+    static create(params) {
+        const config = {
+            auth: {
+                clientId: params.clientId,
+                authority: EntraIdCredentialsProviderFactory.getAuthority(params.authorityConfig ?? { type: 'default' })
+            },
+            system: {
+                loggerOptions
+            }
+        };
+        return new AuthCodeFlowHelper(new msal_node_1.PublicClientApplication(config), params.scopes ?? ['user.read'], params.redirectUri);
+    }
+}
+exports.AuthCodeFlowHelper = AuthCodeFlowHelper;
+//# sourceMappingURL=entra-id-credentials-provider-factory.js.map
